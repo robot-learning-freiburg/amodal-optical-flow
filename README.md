@@ -1,46 +1,63 @@
-# FlowFormer++: Masked Cost Volume Autoencoding for Pretraining Optical Flow Estimation
-<!-- ### [Project Page](https://drinkingcoder.github.io/publication/flowformer/)  -->
+# Amodal Optical Flow
 
-> FlowFormer++: Masked Cost Volume Autoencoding for Pretraining Optical Flow Estimation   
-> Xiaoyu Shi<sup>\*</sup>, [Zhaoyang Huang](https://drinkingcoder.github.io)<sup>\*</sup>, [Dasong Li](https://dasongli1.github.io/), [Manyuan Zhang](https://manyuan97.github.io/), Ka Chun Cheung, Simon See, [Hongwei Qin](http://qinhongwei.com/academic/), [Jifeng Dai](https://jifengdai.org/), [Hongsheng Li](https://www.ee.cuhk.edu.hk/~hsli/)  
-> CVPR 2023  
+[**arXiv**](https://arxiv.org/abs/2311.07761) |
+[**Website**](http://amodal-flow.cs.uni-freiburg.de/) |
+[**Video**](https://www.youtube.com/watch?v=tzeQ0h9ttYM)
 
-<img src="assets/demo.png">
+This repository contains the official implementation of the paper:
 
-## Data Preparation
-We first pretrain FlowFormer++ on the YoutubeVOS dataset. For finetuning, similar to RAFT, you will need to download the required datasets.
-* [YoutubeVOS](https://youtube-vos.org/dataset/)
-* [FlyingChairs](https://lmb.informatik.uni-freiburg.de/resources/datasets/FlyingChairs.en.html#flyingchairs)
-* [FlyingThings3D](https://lmb.informatik.uni-freiburg.de/resources/datasets/SceneFlowDatasets.en.html)
-* [Sintel](http://sintel.is.tue.mpg.de/)
-* [KITTI](http://www.cvlibs.net/datasets/kitti/eval_scene_flow.php?benchmark=flow)
-* [HD1K](http://hci-benchmark.iwr.uni-heidelberg.de/) (optional)
+> **[Amodal Optical Flow](https://arxiv.org/abs/2311.07761)**
+>
+> [Maximilian Luz](https://mxnluz.io/)<sup>\*</sup>,
+> [Rohit Mohan](https://rl.uni-freiburg.de/people/mohan)<sup>\*</sup>,
+> Ahmed Rida Sekkat,
+> Oliver Sawade,
+> Elmar Matthes,
+> [Thomas Brox](https://lmb.informatik.uni-freiburg.de/people/brox/), and
+> [Abhinav Valada](https://rl.uni-freiburg.de/people/valada)
+> <br>
+> *Equal contribution.
+>
+> _IEEE International Conference on Robotics and Automation (ICRA) 2024_ <br/>
 
-By default `datasets.py` will search for the datasets in these locations. You can create symbolic links to wherever the datasets were downloaded in the `datasets` folder
+If you find our work useful, please consider citing our paper [via BibTeX](CITATIONS.bib).
 
-```Shell
-├── datasets
-    ├── Sintel
-        ├── test
-        ├── training
-    ├── KITTI
-        ├── testing
-        ├── training
-        ├── devkit
-    ├── FlyingChairs_release
-        ├── data
-    ├── FlyingThings3D
-        ├── frames_cleanpass
-        ├── frames_finalpass
-        ├── optical_flow
+
+## 📔 Abstract
+
+Optical flow estimation is very challenging in situations with transparent or occluded objects. In this work, we address these challenges at the task level by introducing Amodal Optical Flow, which integrates optical flow with amodal perception. Instead of only representing the visible regions, we define amodal optical flow as a multi-layered pixel-level motion field that encompasses both visible and occluded regions of the scene. To facilitate research on this new task, we extend the AmodalSynthDrive dataset to include pixel-level labels for amodal optical flow estimation. We present several strong baselines, along with the Amodal Flow Quality metric to quantify the performance in an interpretable manner. Furthermore, we propose the novel AmodalFlowNet as an initial step toward addressing this task. AmodalFlowNet consists of a transformer-based cost-volume encoder paired with a recurrent transformer decoder which facilitates recurrent hierarchical feature propagation and amodal semantic grounding. We demonstrate the tractability of amodal optical flow in extensive experiments and show its utility for downstream tasks such as panoptic tracking.
+
+
+## ⚙️ Installation and Requirements
+
+- Create conda environment: `conda create --name amodal-flow python=3.11`
+- Activate conda environment: `conda activate amodal-flow`
+- Install PyTorch: `conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.7 cudatoolkit=11.7 -c pytorch -c nvidia`
+- Install OpenCV: `conda install opencv`
+- Install remaining dependencies: `pip install -r requirements.txt`
+
+This code has been developed and tested with PyTorch version 2.0.1 and CUDA version 11.7.
+
+
+## 💾 Data Preparation
+
+We use pre-trained [FlowFormer++](https://github.com/XiaoyuShi97/FlowFormerPlusPlus) weights to initialize the modal base network and use the [AmodalSynthDrive dataset](http://amodalsynthdrive.cs.uni-freiburg.de/) for amodal training.
+Therefore
+- Download the FlowFormer++ [`sintel.pth` checkpoint](https://drive.google.com/drive/folders/1fyPZvcH4SuNCgnBvIJB2PktT5IN9PYPI) and place it at `./checkpoints/sintel.pth`.
+- Download the [AmodalSynthDrive dataset](http://amodalsynthdrive.cs.uni-freiburg.de/) and place it at `./datasets/AmSynthDrive`.
+
+The final folder structure should look like this:
 ```
-
-## Requirements
-```shell
-conda create --name flowformerpp
-conda activate flowformerpp
-conda install pytorch=1.6.0 torchvision=0.7.0 cudatoolkit=10.1 matplotlib tensorboard scipy opencv -c pytorch
-pip install yacs loguru einops timm==0.4.12 imageio
+.
+├── checkpoints
+│  └── sintel.pth
+├── datasets
+│  ├── AmSynthDrive
+│  │  ├── empty
+│  │  ├── full
+│  │  └...
+│  └── amsynthdrive.json
+└...
 ```
 
 ## Training
@@ -101,24 +118,19 @@ The default image sequence format is:
 ```
 
 
-## License
-FlowFormer++ is released under the Apache License
+## 👩‍⚖️ License
 
-## Citation
-```bibtex
-@inproceedings{shi2023flowformer++,
-  title={Flowformer++: Masked cost volume autoencoding for pretraining optical flow estimation},
-  author={Shi, Xiaoyu and Huang, Zhaoyang and Li, Dasong and Zhang, Manyuan and Cheung, Ka Chun and See, Simon and Qin, Hongwei and Dai, Jifeng and Li, Hongsheng},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  pages={1599--1610},
-  year={2023}
-}
-```
+For academic use, code for AmodalFlowNet is released under the [Apache License](LICENSE), following FlowFormer++.
+For any commercial usage, please contact the authors.
 
-## Acknowledgement
 
-In this project, we use parts of codes in:
+## 🙏 Acknowledgment
+
+The code of this project is based on [FlowFormer++](https://github.com/XiaoyuShi97/FlowFormerPlusPlus).
+Subsequently, we use parts of:
 - [RAFT](https://github.com/princeton-vl/RAFT)
 - [GMA](https://github.com/zacjiang/GMA)
 - [timm](https://github.com/rwightman/pytorch-image-models)
 - [FlowFormer](https://github.com/drinkingcoder/FlowFormer-Official)
+
+In addition, this work was funded by the German Research Foundation (DFG) Emmy Noether Program grant No 468878300 and an academic grant from NVIDIA.
