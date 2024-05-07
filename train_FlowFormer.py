@@ -6,6 +6,7 @@ sys.path.append("core")
 
 import argparse
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,8 +15,9 @@ import torch.nn as nn
 from loguru import logger as loguru_logger
 
 import core.datasets as datasets
+import evaluate_FlowFormer_tile as evaluate
 from core.FlowFormer import build_flowformer
-from core.loss import sequence_loss, sequence_loss_smooth
+from core.loss import amodal_sequence_loss, sequence_loss
 from core.optimizer import fetch_optimizer
 from core.utils.logger import Logger
 from core.utils.misc import process_cfg
@@ -41,11 +43,6 @@ except ImportError:
             pass
 
 
-# exclude extremly large displacements
-# VAL_FREQ = 5000
-
-
-# torch.autograd.set_detect_anomaly(True)
 def on_load_checkpoint(state_dict, model_state_dict):
     is_changed = False
     for k in state_dict:
@@ -66,21 +63,21 @@ def count_parameters(model):
 
 
 def train(cfg):
-
     loss_func = sequence_loss
     if cfg.use_smoothl1:
-        print("[Using smooth L1 loss]")
-        loss_func = sequence_loss_smooth
+        raise ValueError("Smooth L1 loss not supported")
 
     model = nn.DataParallel(build_flowformer(cfg))
     loguru_logger.info("Parameter Count: %d" % count_parameters(model))
 
     if cfg.restore_ckpt is not None:
-        print("[Loading ckpt from {}]".format(cfg.restore_ckpt))
-        # checkpoint = torch.load(cfg.restore_ckpt)
-        # checkpoint = on_load_checkpoint(checkpoint, model.state_dict())
-        # model.load_state_dict(checkpoint, strict=False)
-        model.load_state_dict(torch.load(cfg.restore_ckpt), strict=True)
+        loguru_logger.info(f"Loading ckpt from {cfg.restore_ckpt}")
+        try:
+            model.load_state_dict(torch.load(cfg.restore_ckpt), strict=True)
+        except RuntimeError as e:
+            loguru_logger.warning(f"Failed to load state dict in strict mode: {e}")
+            loguru_logger.warning(f"Falling back to strict=False")
+            model.load_state_dict(torch.load(cfg.restore_ckpt), strict=False)
 
     model.cuda()
     model.train()
@@ -99,10 +96,22 @@ def train(cfg):
 
     should_keep_training = True
     while should_keep_training:
-
         for i_batch, data_blob in enumerate(train_loader):
+            t_start = time.time()
+
             optimizer.zero_grad()
-            image1, image2, flow, valid = [x.cuda() for x in data_blob]
+
+            if cfg.amodal:
+                image1, image2, flow, valid, sseg = data_blob
+
+                image1, image2 = image1.cuda(), image2.cuda()
+                flow = [flow[0].cuda(), flow[1].cuda()] + [
+                    (f.cuda(), m.cuda()) for f, m in flow[2:]
+                ]
+                valid = [v.cuda() for v in valid]
+                sseg = [s.cuda() for s in sseg]
+            else:
+                image1, image2, flow, valid = [x.cuda() for x in data_blob]
 
             if cfg.add_noise:
                 # print("[Adding noise]")
@@ -116,7 +125,12 @@ def train(cfg):
 
             output = {}
             flow_predictions = model(image1, image2, output)
-            loss, metrics = loss_func(flow_predictions, flow, valid, cfg)
+
+            if cfg.amodal:
+                loss, metrics = amodal_sequence_loss(flow_predictions, flow, valid, sseg, cfg)
+            else:
+                loss, metrics = sequence_loss(flow_predictions, flow, valid, cfg)
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.trainer.clip)
@@ -125,8 +139,36 @@ def train(cfg):
             scheduler.step()
             scaler.update()
 
+            t_delta = time.time() - t_start
+            loguru_logger.info(f"step: {total_steps}, time: {t_delta:.2}s")
+
             metrics.update(output)
             logger.push(metrics)
+
+            if total_steps % cfg.val_freq == cfg.val_freq - 1:
+                path = "%s/%d_%s.pth" % (cfg.log_dir, total_steps + 1, cfg.name)
+                torch.save(model.state_dict(), path)
+
+                results = {}
+                for val_dataset in cfg.validation:
+                    if val_dataset == "chairs":
+                        results.update(evaluate.validate_chairs(model.module))
+                    elif val_dataset == "sintel":
+                        results.update(evaluate.validate_sintel(model.module))
+                    elif val_dataset == "kitti":
+                        results.update(evaluate.validate_kitti(model.module))
+                    elif val_dataset == "amsynthdrive":
+                        results.update(
+                            evaluate.validate_amsynthdrive(
+                                model.module, batch_size=cfg.batch_size
+                            )
+                        )
+                    else:
+                        raise ValueError(f"unknown validation dataset {val_dataset}")
+
+                logger.write_dict(results)
+
+                model.train()
 
             total_steps += 1
 
@@ -161,6 +203,8 @@ if __name__ == "__main__":
         from configs.sintel import get_cfg
     elif args.stage == "kitti":
         from configs.kitti import get_cfg
+    elif args.stage == "amsynthdrive":
+        from configs.amsynthdrive import get_cfg
 
     cfg = get_cfg()
     cfg.update(vars(args))

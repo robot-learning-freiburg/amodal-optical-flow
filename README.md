@@ -60,62 +60,39 @@ The final folder structure should look like this:
 └...
 ```
 
-## Training
-The script will load the config according to the training stage. The trained model will be saved in a directory in `logs`. For example, the following script will load the config `configs/pretrain_config.py`. The trained model will be saved as `logs/xxxx/final`.
+
+## 🏃 Training and Evaluation
+
+The configuration used for both evaluation and training can be found at [`./configs/amsynthdrive.py`](configs/amsynthdrive.py).
+Training output will be saved in a subdirectory of the `logs` directory. 
+
+### Training
+
+Our model can be trained by running
 ```shell
-python -u pretrain_FlowFormer_maemask.py --stage youtube
+python ./train_FlowFormer.py --name amsynthdrive --stage amsynthdrive --validation amsynthdrive
 ```
-To finish the entire finetuning schedule, you can run:
+We train our model using 6 GPUs with 48 GB VRAM each.
+
+### Evaluation
+
+For a given checkpoint `logs/some_run/model.pth`, the model can be evaluated using
 ```shell
-./run_train.sh
+python ./evaluate_FlowFormer_tile.py --eval amsynthdrive_validation --model logs/some_run/model.pth
 ```
+For evaluation, a single 12GB GPU is enough.
 
-## Models
-We provide [models](https://drive.google.com/drive/folders/1fyPZvcH4SuNCgnBvIJB2PktT5IN9PYPI?usp=sharing) trained in the four stages. The default path of the models for evaluation is:
-```Shell
-├── checkpoints
-    ├── chairs.pth
-    ├── things.pth
-    ├── sintel.pth
-    ├── kitti.pth
-    ├── things_288960.pth
-```
 
-## Evaluation
-The model to be evaluated is assigned by the `_CN.model` in the config file.
+## 🤖 Models
 
-Evaluating the model on the Sintel training set and the KITTI training set. The corresponding config file is `configs/submissions.py`.
-```Shell
-# with tiling technique
-python evaluate_FlowFormer_tile.py --eval sintel_validation
-python evaluate_FlowFormer_tile.py --eval kitti_validation --model checkpoints/things_kitti.pth
-```
+We will provide a pre-trained checkpoint soon.
 
-Generating the submission for the Sintel and KITTI benchmarks. The corresponding config file is `configs/submissions.py`.
-```Shell
-python evaluate_FlowFormer_tile.py --eval sintel_submission
-python evaluate_FlowFormer_tile.py --eval kitti_submission
-```
-Visualizing the sintel dataset:
-```Shell
-python visualize_flow.py --eval_type sintel --keep_size
-```
-Visualizing an image sequence extracted from a video:
-```Shell
-python visualize_flow.py --eval_type seq
-```
-The default image sequence format is:
-```Shell
-├── demo_data
-    ├── mihoyo
-        ├── 000001.png
-        ├── 000002.png
-        ├── 000003.png
-            .
-            .
-            .
-        ├── 001000.png
-```
+
+## 📒 Notes
+
+- The initial training, resuming from a pre-trained FlowFormer++ checkpoint, will generate a warning that the base checkpoint could not be loaded in strict mode. This is expected. The missing keys are the additional amodal decoder strands added on top of FlowFormer++.
+
+- While AmodalSynthDrive uses `.png` files for storing optical flow similar to KITTI, the scaling differs. Please refer to `readFlowKITTI()` in [`core/utils/frame_utils.py`](core/utils/frame_utils.py#L106) on how to load AmodalSynthDrive flow files.
 
 
 ## 👩‍⚖️ License

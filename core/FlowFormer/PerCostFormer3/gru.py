@@ -217,10 +217,7 @@ class SKMotionEncoder(nn.Module):
     def __init__(self, args):
         super(SKMotionEncoder, self).__init__()
 
-        if args.r_16 > 0:
-            cor_planes = 81 * args.cost_heads_num + args.query_latent_dim + args.r_16**2
-        else:
-            cor_planes = 81 * args.cost_heads_num + args.query_latent_dim
+        cor_planes = 81 * args.cost_heads_num + args.query_latent_dim
 
         self.sk_c = SKBlock(input_dim=cor_planes, hidden_dim=192)
         self.sk_f = SKBlock(input_dim=2, hidden_dim=64)
@@ -250,10 +247,7 @@ class BasicMotionEncoder(nn.Module):
     def __init__(self, args):
         super(BasicMotionEncoder, self).__init__()
 
-        if args.r_16 > 0:
-            cor_planes = 81 * args.cost_heads_num + args.query_latent_dim + args.r_16**2
-        else:
-            cor_planes = 81 * args.cost_heads_num + args.query_latent_dim
+        cor_planes = 81 * args.cost_heads_num + args.query_latent_dim
 
         self.convc1 = nn.Conv2d(cor_planes, 256, 1, padding=0)
         self.convc2 = nn.Conv2d(256, 192, 3, padding=1)
@@ -276,10 +270,7 @@ class ConvAttMotionEncoder(nn.Module):
     def __init__(self, args):
         super(ConvAttMotionEncoder, self).__init__()
 
-        if args.r_16 > 0:
-            cor_planes = 81 * args.cost_heads_num + args.query_latent_dim + args.r_16**2
-        else:
-            cor_planes = 81 * args.cost_heads_num + args.query_latent_dim
+        cor_planes = 81 * args.cost_heads_num + args.query_latent_dim
 
         self.convc = nn.Conv2d(cor_planes, 128, 1, padding=0)
         self.convf = nn.Conv2d(2, 64, 7, padding=3)

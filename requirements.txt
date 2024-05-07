@@ -6,3 +6,5 @@ imageio
 matplotlib
 tensorboard
 scipy
+parse
+tqdm

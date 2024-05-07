@@ -107,7 +107,12 @@ def readFlowKITTI(filename):
     flow = cv2.imread(filename, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
     flow = flow[:, :, ::-1].astype(np.float32)
     flow, valid = flow[:, :, :2], flow[:, :, 2]
-    flow = (flow - 2**15) / 64.0
+
+    MAX_FLOW = 695
+    MIN_FLOW = -1687
+
+    flow = (flow / np.iinfo(np.uint16).max) * (MAX_FLOW - MIN_FLOW) + MIN_FLOW
+
     return flow, valid
 
 
@@ -140,3 +145,26 @@ def read_gen(file_name, pil=False):
         else:
             return flow[:, :, :-1]
     return []
+
+
+def read_gen_flow(file_name, pil=False):
+    ext = splitext(file_name)[-1]
+    if ext == ".jpeg" or ext == ".ppm" or ext == ".jpg":
+        return Image.open(file_name), None
+    elif ext == ".bin" or ext == ".raw":
+        return np.load(file_name), None
+    elif ext == ".flo":
+        return readFlow(file_name).astype(np.float32), None
+    elif ext == ".png":
+        return readFlowKITTI(file_name)
+    elif ext == ".pfm":
+        flow = readPFM(file_name).astype(np.float32)
+        if len(flow.shape) == 2:
+            return flow, None
+        else:
+            return flow[:, :, :-1], None
+    return []
+
+
+def read_semantics(file_name):
+    return cv2.imread(file_name, cv2.IMREAD_UNCHANGED)

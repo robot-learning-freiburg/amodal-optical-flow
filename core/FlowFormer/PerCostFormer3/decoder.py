@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from timm.models.layers import DropPath
 
 from ...utils.utils import bilinear_sampler, coords_grid
+from ...utils import labels
 from .attention import (
     ExpPositionEmbeddingSine,
     LinearPositionEmbeddingSine,
@@ -75,7 +76,7 @@ class CrossAttentionLayer(nn.Module):
             print("[No short cut in cost decoding]")
         self.dim = qk_dim
 
-    def forward(self, query, key, value, memory, query_coord, patch_size, size_h3w3):
+    def forward(self, query, key, value, memory, query_coord):
         """
         query_coord [B, 2, H1, W1]
         """
@@ -152,7 +153,7 @@ class MemoryDecoderLayer(nn.Module):
             no_sc=cfg.no_sc,
         )
 
-    def forward(self, query, key, value, memory, coords1, size, size_h3w3):
+    def forward(self, query, key, value, memory, coords1, size):
         """
         x:      [B*H1*W1, 1, C]
         memory: [B*H1*W1, H2'*W2', C]
@@ -162,9 +163,7 @@ class MemoryDecoderLayer(nn.Module):
            Should first convert it into H2', W2' space.
         2. We assume the upper-left point to be [0, 0], instead of letting center of upper-left patch to be [0, 0]
         """
-        x_global, k, v = self.cross_attend(
-            query, key, value, memory, coords1, self.patch_size, size_h3w3
-        )
+        x_global, k, v = self.cross_attend(query, key, value, memory, coords1)
         B, C, H1, W1 = size
         C = self.cfg.query_latent_dim
         x_global = x_global.view(B, H1, W1, C).permute(0, 3, 1, 2)
@@ -229,9 +228,14 @@ class MemoryDecoder(nn.Module):
         self.depth = cfg.decoder_depth
         self.decoder_layer = MemoryDecoderLayer(dim, cfg)
 
+        n_fullcls = labels.N_CLASSES_FULL
+        n_amcls = labels.N_CLASSES_AMODAL
+
         if self.cfg.gma == "GMA":
             print("[Using GMA]")
             self.update_block = GMAUpdateBlock(self.cfg, hidden_dim=128)
+            self.update_block_bg = GMAUpdateBlock(self.cfg, hidden_dim=128)
+            self.update_block_am = GMAUpdateBlock(self.cfg, hidden_dim=128)
             self.att = Attention(
                 args=self.cfg, dim=128, heads=1, max_pos_size=160, dim_head=128
             )
@@ -240,34 +244,101 @@ class MemoryDecoder(nn.Module):
             self.update_block = SKUpdateBlock6_Deep_nopoolres_AllDecoder(
                 args=self.cfg, hidden_dim=128
             )
+            self.update_block_bg = SKUpdateBlock6_Deep_nopoolres_AllDecoder(
+                args=self.cfg, hidden_dim=128
+            )
+            self.update_block_am = SKUpdateBlock6_Deep_nopoolres_AllDecoder(
+                args=self.cfg, hidden_dim=128
+            )
             self.att = Attention(
                 args=self.cfg, dim=128, heads=1, max_pos_size=160, dim_head=128
             )
         else:
             print("[Not using GMA decoder]")
             self.update_block = BasicUpdateBlock(self.cfg, hidden_dim=128)
+            self.update_block_bg = BasicUpdateBlock(self.cfg, hidden_dim=128)
+            self.update_block_am = BasicUpdateBlock(self.cfg, hidden_dim=128)
 
         if self.cfg.r_16 > 0:
-            print("[r_16 = {}]".format(self.cfg.r_16))
+            raise ValueError("r_16 > 0 is unsupported")
 
         if self.cfg.quater_refine:
-            print("[Using Quater Refinement]")
-            from .quater_upsampler import quater_upsampler
+            raise ValueError("Using Quater Refinement is not supported")
 
-            self.quater_upsampler = quater_upsampler()
+        self.combine_bg = nn.Sequential(
+            nn.Conv2d(
+                2 * 128 + 2 + n_fullcls, 256, 3, padding=1
+            ),  # 2x state + flow + semantics
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
 
-    def upsample_flow(self, flow, mask):
-        """Upsample flow field [H/8, W/8, 2] -> [H, W, 2] using convex combination"""
-        N, _, H, W = flow.shape
+        self.combine_am0 = nn.Sequential(
+            nn.Conv2d(
+                2 * 128 + 2 + n_fullcls, 256, 3, padding=1
+            ),  # 2x state + flow + semantics
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.combine_am1 = nn.Sequential(
+            nn.Conv2d(
+                4 * 128 + 2 + 2, 256, 3, padding=1
+            ),  # 4x state + flow + 2x amodal mask
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.object_logits = nn.Sequential(
+            nn.Conv2d(2 * 128 + 128, 256, 3, padding=1),  # 2x state + context
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, n_fullcls, 1, padding=0),
+        )
+
+        self.amodal_visible_logits = nn.Sequential(
+            nn.Conv2d(4 * 128 + 128, 256, 3, padding=1),  # 4x state + context
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1, 1, padding=0),
+        )
+
+        self.amodal_occlusion_logits = nn.Sequential(
+            nn.Conv2d(
+                4 * 128 + 128 + 1, 256, 3, padding=1
+            ),  # 4x state + context + visible-mask
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1, 1, padding=0),
+        )
+
+        self.amodal_score_logits = nn.Sequential(
+            nn.Conv2d(128 + 2, 256, 3, padding=1),  # 1x state + flow
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 1, 1, padding=0),
+        )
+
+        self.amodal_class_logits = nn.Sequential(
+            nn.Conv2d(128 + 2, 256, 3, padding=1),  # 1x state + flow
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, n_amcls, 1, padding=0),
+        )
+
+        self.proj_bg = nn.Conv2d(256, 128, 1)
+        self.proj_am = nn.Conv2d(256, 128, 1)
+
+    def upsample_field(self, flow, mask):
+        """Upsample vector/feature field [H/8, W/8, C] -> [H, W, C] using convex combination"""
+        N, C, H, W = flow.shape
         mask = mask.view(N, 1, 9, 8, 8, H, W)
         mask = torch.softmax(mask, dim=2)
 
         up_flow = F.unfold(8 * flow, [3, 3], padding=1)
-        up_flow = up_flow.view(N, 2, 9, 1, 1, H, W)
+        up_flow = up_flow.view(N, C, 9, 1, 1, H, W)
 
         up_flow = torch.sum(mask * up_flow, dim=2)
         up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
-        return up_flow.reshape(N, 2, 8 * H, 8 * W)
+        return up_flow.reshape(N, C, 8 * H, 8 * W)
 
     def sample_feature_map(self, coords, feat_t_quater, r=1):
         H, W = feat_t_quater.shape[-2:]
@@ -304,13 +375,82 @@ class MemoryDecoder(nn.Module):
         corr = corr.view(batch, h1, w1, -1).permute(0, 3, 1, 2)
         return corr
 
+    def encode_cost_query(self, cost, cost_patches, coords1, size):
+        if self.cfg.use_patch:
+            if self.cfg.detach_local:
+                _local_cost = self.encode_flow_token(cost_patches, coords1 / 8.0, r=0)
+                _local_cost = _local_cost.contiguous().detach()
+                query = self.flow_token_encoder(_local_cost)
+            else:
+                query = self.flow_token_encoder(
+                    self.encode_flow_token(cost_patches, coords1 / 8.0, r=0)
+                )
+        else:
+            if self.cfg.detach_local:
+                _local_cost = cost.contiguous().detach()
+                query = self.flow_token_encoder(_local_cost)
+            else:
+                query = self.flow_token_encoder(cost)
+
+        query = query.permute(0, 2, 3, 1).contiguous()
+        query = query.view(size[0] * size[2] * size[3], 1, self.dim)
+
+        return query
+
+    def decode_correlation(
+        self, coords0, coords1, query, key, value, cost_memory, cost_forward, size
+    ):
+        if self.cfg.use_rpe:
+            query_coord = coords1 - coords0
+        else:
+            query_coord = coords1
+
+        cost_global, key, value = self.decoder_layer(
+            query, key, value, cost_memory, query_coord, size
+        )
+
+        corr = torch.cat([cost_global, cost_forward], dim=1)
+
+        return corr, key, value
+
+    def compute_flow_delta(self, fn, net, inp, corr, flow, attention):
+        if self.cfg.gma is not None:
+            net, up_mask, flow_delta = fn(net, inp, corr, flow, attention)
+        else:
+            net, up_mask, flow_delta = fn(net, inp, corr, flow)
+
+        return net, up_mask, flow_delta
+
+    def compute_score_logits(self, net, visible_mask, occlusion_mask):
+        x = torch.cat((net, visible_mask, occlusion_mask), dim=1)
+        return self.amodal_score_logits(x)
+
+    def compute_amodal_class_logits(self, net, visible_mask, occlusion_mask):
+        x = torch.cat((net, visible_mask, occlusion_mask), dim=1)
+        return self.amodal_class_logits(x)
+
+    def compute_object_logits(self, net_full, net_empty, ctx):
+        x = torch.cat((net_full, net_empty, ctx), dim=1)
+        return self.object_logits(x)
+
+    def compute_amodal_visible_logits(
+        self, net_full, net_empty, net_amodal, net_amodal_prev, ctx
+    ):
+        x = torch.cat((net_full, net_empty, net_amodal, net_amodal_prev, ctx), dim=1)
+        return self.amodal_visible_logits(x)
+
+    def compute_amodal_occlusion_logits(
+        self, net_full, net_empty, net_amodal, net_amodal_prev, ctx, visible_mask
+    ):
+        x = torch.cat(
+            (net_full, net_empty, net_amodal, net_amodal_prev, ctx, visible_mask), dim=1
+        )
+        return self.amodal_occlusion_logits(x)
+
     def forward(
         self,
         cost_memory,
         context,
-        context_quater,
-        feat_s_quater,
-        feat_t_quater,
         data={},
         flow_init=None,
         cost_patches=None,
@@ -320,290 +460,142 @@ class MemoryDecoder(nn.Module):
         context: [B, D, H1, W1]
         """
         cost_maps = data["cost_maps"]
-        coords0, coords1 = initialize_flow(context)
+        coords0, coords1_fg = initialize_flow(context)
+
+        coords1_bg = coords1_fg.detach().clone()
+        coords1_am = [
+            coords1_fg.detach().clone() for _ in range(self.cfg.amodal_layers)
+        ]
 
         if flow_init is not None:
-            # print("[Using warm start]")
-            coords1 = coords1 + flow_init
-
-        # flow = coords1
+            raise RuntimeError("warm-start not supported")
 
         flow_predictions = []
 
-        context = self.proj(context)
-        net, inp = torch.split(context, [128, 128], dim=1)
-        net = torch.tanh(net)
+        net_fg, inp = torch.split(self.proj(context), [128, 128], dim=1)
+        net_fg = torch.tanh(net_fg)
         inp = torch.relu(inp)
+
+        net_bg = torch.tanh(self.proj_bg(context))
+
+        net_am = torch.tanh(self.proj_am(context))
+        net_am = [None] + [net_am.clone() for _ in range(self.cfg.amodal_layers)]
+
+        attention = None
         if self.cfg.gma is not None:
             attention = self.att(inp)
 
-        size = net.shape
+        size = net_fg.shape
+
         key, value = None, None
 
         for idx in range(self.depth):
-            coords1 = coords1.detach()
+            coords1_fg = coords1_fg.detach()
+            coords1_bg = coords1_bg.detach()
+            coords1_am = [c.detach() for c in coords1_am]
 
-            cost_forward = self.encode_flow_token(cost_maps, coords1)
+            # sample costs (forward flow) from cost map
+            cost_fg = self.encode_flow_token(cost_maps, coords1_fg)
+            cost_bg = self.encode_flow_token(cost_maps, coords1_bg)
+            cost_am = [self.encode_flow_token(cost_maps, c) for c in coords1_am]
 
-            if self.cfg.use_patch:
-                if self.cfg.detach_local:
-                    _local_cost = self.encode_flow_token(
-                        cost_patches, coords1 / 8.0, r=0
-                    )
-                    _local_cost = _local_cost.contiguous().detach()
-                    query = self.flow_token_encoder(_local_cost)
-                else:
-                    query = self.flow_token_encoder(
-                        self.encode_flow_token(cost_patches, coords1 / 8.0, r=0)
-                    )
-            else:
-                if self.cfg.detach_local:
-                    _local_cost = cost_forward.contiguous().detach()
-                    query = self.flow_token_encoder(_local_cost)
-                else:
-                    query = self.flow_token_encoder(cost_forward)
-            query = (
-                query.permute(0, 2, 3, 1)
-                .contiguous()
-                .view(size[0] * size[2] * size[3], 1, self.dim)
+            # encode sampled costs into actual query
+            query_fg = self.encode_cost_query(cost_fg, cost_patches, coords1_fg, size)
+            query_bg = self.encode_cost_query(cost_bg, cost_patches, coords1_bg, size)
+            query_am = [
+                self.encode_cost_query(cv, cost_patches, c1, size)
+                for cv, c1 in zip(cost_am, coords1_am)
+            ]
+
+            # decode corsts/correlation from cost memory
+            corr_fg, key, value = self.decode_correlation(
+                coords0, coords1_fg, query_fg, key, value, cost_memory, cost_fg, size
+            )
+            corr_bg, _, _ = self.decode_correlation(
+                coords0, coords1_bg, query_bg, key, value, cost_memory, cost_bg, size
+            )
+            corr_am = [
+                self.decode_correlation(
+                    coords0, c1, q, key, value, cost_memory, cv, size
+                )[0]
+                for cv, c1, q in zip(cost_am, coords1_am, query_am)
+            ]
+
+            # current flow estimate
+            flow_fg = coords1_fg - coords0
+            flow_bg = coords1_bg - coords0
+            flow_am = [c - coords0 for c in coords1_am]
+
+            # full/foreground: compute flow delta, update and upsample flow
+            net_fg, up_mask_fg, delta_fg = self.compute_flow_delta(
+                self.update_block, net_fg, inp, corr_fg, flow_fg, attention
             )
 
-            if self.cfg.use_rpe:
-                query_coord = coords1 - coords0
-            else:
-                query_coord = coords1
-            cost_global, key, value = self.decoder_layer(
-                query, key, value, cost_memory, query_coord, size, data["H3W3"]
+            coords1_fg = coords1_fg + delta_fg
+            flow_fg = coords1_fg - coords0
+            flow_up_fg = self.upsample_field(flow_fg, up_mask_fg)
+
+            # compute combined object/motion mask
+            object_logits = self.compute_object_logits(net_fg, net_bg, inp)
+            object_semantics = F.softmax(object_logits, dim=1)
+            object_logits_up = self.upsample_field(object_logits, up_mask_fg)
+
+            # background: compute flow delta, update and upsample flow
+            net_bg = torch.cat((net_bg, net_fg, flow_fg, object_semantics), dim=1)
+            net_bg = self.combine_bg(net_bg)
+            net_bg, up_mask_bg, delta_bg = self.compute_flow_delta(
+                self.update_block_bg, net_bg, inp, corr_bg, flow_bg, attention
             )
 
-            if self.cfg.r_16 > 0:
-                cost_forward_16 = self.encode_flow_token(
-                    data["cost_maps_16"], coords1 * 2.0, r=(self.cfg.r_16 - 1) // 2
+            coords1_bg = coords1_bg + delta_bg
+            flow_up_bg = self.upsample_field(coords1_bg - coords0, up_mask_bg)
+
+            # amodal flow: compute flow delta, update and upsample flow
+            net_am[0] = torch.cat((net_bg, net_fg, flow_fg, object_semantics), dim=1)
+            net_am[0] = self.combine_am0(net_am[0])
+
+            res_am = []
+            for i in range(self.cfg.amodal_layers):
+                visible_logits = self.compute_amodal_visible_logits(
+                    net_fg, net_bg, net_am[i + 1], net_am[i], inp
+                )
+                visible_mask = torch.sigmoid(visible_logits)
+
+                occlusion_logits = self.compute_amodal_occlusion_logits(
+                    net_fg, net_bg, net_am[i + 1], net_am[i], inp, visible_mask
+                )
+                occlusion_mask = torch.sigmoid(occlusion_logits)
+
+                net = torch.cat((net_fg, net_bg, net_am[i + 1], net_am[i]), dim=1)
+                net = torch.cat((net, flow_fg, visible_mask, occlusion_mask), dim=1)
+                net = self.combine_am1(net)
+
+                net, up_mask, delta = self.compute_flow_delta(
+                    self.update_block_am, net, inp, corr_am[i], flow_am[i], attention
                 )
 
-                corr = torch.cat([cost_global, cost_forward, cost_forward_16], dim=1)
-            else:
-                corr = torch.cat([cost_global, cost_forward], dim=1)
+                net_am[i + 1] = net
 
-            flow = coords1 - coords0
+                coords1_am[i] = coords1_am[i] + delta
+                flow_up = self.upsample_field(coords1_am[i] - coords0, up_mask)
 
-            if self.cfg.gma is not None:
-                net, up_mask, delta_flow = self.update_block(
-                    net, inp, corr, flow, attention
+                score = self.compute_score_logits(net, visible_mask, occlusion_mask)
+                score_up = self.upsample_field(score, up_mask)
+
+                amcls = self.compute_amodal_class_logits(net, visible_mask, occlusion_mask)
+                amcls_up = self.upsample_field(amcls, up_mask)
+
+                visible_logits_up = self.upsample_field(visible_logits, up_mask)
+                occlusion_logits_up = self.upsample_field(occlusion_logits, up_mask)
+
+                res_am.append(
+                    (flow_up, score_up, amcls_up, visible_logits_up, occlusion_logits_up)
                 )
-            else:
-                net, up_mask, delta_flow = self.update_block(net, inp, corr, flow)
 
-            # flow = delta_flow
-            coords1 = coords1 + delta_flow
-
-            flow_up = self.upsample_flow(coords1 - coords0, up_mask)
-            flow_predictions.append(flow_up)
-
-        if self.cfg.quater_refine:
-            coords1 = coords1.detach()
-            new_size = context_quater.shape[-2:]
-            flow = 2 * F.interpolate(
-                coords1 - coords0, size=new_size, mode="bilinear", align_corners=True
-            )
-            flow_up = self.quater_upsampler(
-                flow, context_quater, feat_s_quater, feat_t_quater, r=1
-            )
-            flow_predictions.append(flow_up)
+            flow_predictions.append([flow_up_fg, flow_up_bg, object_logits_up] + res_am)
 
         if self.training:
             return flow_predictions
         else:
-            return flow_predictions[-1], coords1 - coords0
-
-    def pretrain_forward(
-        self,
-        cost_memory,
-        context,
-        data={},
-        flow_init=None,
-        cost_patches=None,
-        mask_for_patch1=None,
-    ):
-
-        cost_maps_outter = data["cost_maps_outter"].detach()
-        cost_maps = data["cost_maps"].detach()
-
-        _, _, H_outter, W_outter = cost_maps_outter.shape
-        Bs, _, H_inner, W_inner = cost_maps.shape
-        # print(H_inner,W_inner,H_outter,W_outter, self.cfg.H_offset, self.cfg.W_offset)
-        # exit()
-
-        net, inp = torch.split(context, [128, 128], dim=1)
-
-        size = net.shape
-        B = size[0]
-        key, value = None, None
-
-        loss = 0
-
-        if self.cfg.fix_pe:
-
-            pad_l = pad_t = 0
-            pad_r = (8 - W_inner % 8) % 8
-            pad_b = (8 - H_inner % 8) % 8
-            _H_inner = H_inner + pad_b
-            _W_inner = W_inner + pad_r
-
-            # number of keys for crossattentionlayer
-            H_down = _H_inner // 8
-            W_down = _W_inner // 8
-
-            cost_maps = F.pad(cost_maps, (pad_l, pad_r, pad_t, pad_b))
-            cost_maps_patches = F.unfold(cost_maps, kernel_size=8, padding=0, stride=8)
-            mean = cost_maps_patches.mean(dim=1, keepdim=True)
-            var = cost_maps_patches.var(dim=1, keepdim=True)
-            cost_maps_patches = (cost_maps_patches - mean) / (var + 1.0e-6) ** 0.5
-            cost_maps_patches = cost_maps_patches.reshape(Bs, 64, H_down, W_down)
-
-            for idx_h, idx_w in zip(range(H_down), range(W_down)):
-                query_coord = torch.zeros(
-                    B, 2, H_inner, W_inner, device=cost_memory.device
-                )
-                query_coord[:, 0, :, :] = idx_w
-                query_coord[:, 1, :, :] = idx_h
-                cost_global, key, value = self.decoder_layer(
-                    None,
-                    key,
-                    value,
-                    cost_memory,
-                    query_coord.detach(),
-                    size,
-                    data["H3W3"],
-                )
-                cost_forward_pred = self.pretrain_head(cost_global)
-
-                target = (
-                    cost_maps_patches[:, :, idx_h, idx_w]
-                    .reshape(B, H_inner, W_inner, 64)
-                    .permute(0, 3, 1, 2)
-                )
-                loss += ((cost_forward_pred - target) ** 2).mean()
-        elif self.cfg.gt_r > 0:
-            for idx in range(self.cfg.query_num):
-                coords_outter = torch.rand(
-                    B, 2, H_inner, W_inner, device=cost_memory.device
-                )
-                radius = (self.cfg.gt_r - 1) // 2
-                if self.cfg.no_border:
-                    coords_outter = (
-                        torch.cat(
-                            [
-                                coords_outter[:, 0:1, :, :]
-                                * (W_outter - self.cfg.gt_r),
-                                coords_outter[:, 1:, :, :] * (H_outter - self.cfg.gt_r),
-                            ],
-                            dim=1,
-                        )
-                        + radius
-                    )
-                else:
-                    coords_outter = torch.cat(
-                        [
-                            coords_outter[:, 0:1, :, :] * W_outter,
-                            coords_outter[:, 1:, :, :] * H_outter,
-                        ],
-                        dim=1,
-                    )
-
-                coords_inner = torch.cat(
-                    [
-                        coords_outter[:, 0:1, :, :] - self.cfg.W_offset // 8,
-                        coords_outter[:, 1:, :, :] - self.cfg.H_offset // 8,
-                    ],
-                    dim=1,
-                )
-
-                cost_forward_outter = self.encode_flow_token(
-                    cost_maps_outter.detach(), coords_outter.detach(), r=radius
-                )
-
-                query_coord = coords_inner
-                cost_forward = self.encode_flow_token(cost_maps.detach(), coords_inner)
-                query = self.flow_token_encoder(cost_forward)
-                query = (
-                    query.permute(0, 2, 3, 1)
-                    .contiguous()
-                    .view(size[0] * size[2] * size[3], 1, self.dim)
-                )
-                cost_global, key, value = self.decoder_layer(
-                    query,
-                    key,
-                    value,
-                    cost_memory,
-                    query_coord.detach(),
-                    size,
-                    data["H3W3"],
-                )
-
-                cost_forward_pred = self.pretrain_head(cost_global)
-                mean = cost_forward_outter.mean(dim=1, keepdim=True)
-                var = cost_forward_outter.var(dim=1, keepdim=True)
-                cost_forward_outter = (cost_forward_outter - mean) / (
-                    var + 1.0e-6
-                ) ** 0.5
-
-                loss += ((cost_forward_pred - cost_forward_outter) ** 2).mean()
-        else:
-            for idx in range(self.cfg.query_num):
-                coords_outter = torch.rand(
-                    B, 2, H_inner, W_inner, device=cost_memory.device
-                )
-                if self.cfg.no_border:
-                    coords_outter = (
-                        torch.cat(
-                            [
-                                coords_outter[:, 0:1, :, :] * (W_outter - 8),
-                                coords_outter[:, 1:, :, :] * (H_outter - 8),
-                            ],
-                            dim=1,
-                        )
-                        + 4.0
-                    )
-                else:
-                    coords_outter = torch.cat(
-                        [
-                            coords_outter[:, 0:1, :, :] * W_outter,
-                            coords_outter[:, 1:, :, :] * H_outter,
-                        ],
-                        dim=1,
-                    )
-
-                coords_inner = torch.cat(
-                    [
-                        coords_outter[:, 0:1, :, :] - self.cfg.W_offset // 8,
-                        coords_outter[:, 1:, :, :] - self.cfg.H_offset // 8,
-                    ],
-                    dim=1,
-                )
-
-                cost_forward_outter = self.encode_flow_token(
-                    cost_maps_outter.detach(), coords_outter.detach()
-                )
-
-                query_coord = coords_inner
-                cost_global, key, value = self.decoder_layer(
-                    None,
-                    key,
-                    value,
-                    cost_memory,
-                    query_coord.detach(),
-                    size,
-                    data["H3W3"],
-                )
-
-                cost_forward_pred = self.pretrain_head(cost_global)
-                mean = cost_forward_outter.mean(dim=1, keepdim=True)
-                var = cost_forward_outter.var(dim=1, keepdim=True)
-                cost_forward_outter = (cost_forward_outter - mean) / (
-                    var + 1.0e-6
-                ) ** 0.5
-
-                loss += ((cost_forward_pred - cost_forward_outter) ** 2).mean()
-
-        return loss
+            # TODO: implement warm-start for the amodal setting
+            return flow_predictions[-1], coords1_fg - coords0

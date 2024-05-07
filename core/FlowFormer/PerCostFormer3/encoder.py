@@ -435,73 +435,6 @@ class CostPerceiverEncoder(nn.Module):
         short_cut = x
 
         for idx, layer in enumerate(self.encoder_layers):
-
-            x = layer(x)
-            if self.cfg.vertical_encoder_attn is not None:
-                x = (
-                    x.view(B, H1 * W1, self.cfg.cost_latent_token_num, -1)
-                    .permute(0, 2, 1, 3)
-                    .reshape(B * self.cfg.cost_latent_token_num, H1 * W1, -1)
-                )
-                x = self.vertical_encoder_layers[idx](x, (H1, W1), context)
-                x = (
-                    x.view(B, self.cfg.cost_latent_token_num, H1 * W1, -1)
-                    .permute(0, 2, 1, 3)
-                    .reshape(B * H1 * W1, self.cfg.cost_latent_token_num, -1)
-                )
-
-        if self.cfg.cost_encoder_res is True:
-            x = x + short_cut
-
-        _B, _HW, _C = cost_patches.shape
-        cost_patches = cost_patches.reshape(_B, H3, W3, _C).permute(0, 3, 1, 2)
-
-        return x, cost_patches
-
-    def pretrain_forward(
-        self, cost_volume_outter, cost_volume, data, context=None, mask=None
-    ):
-        B, heads, H1, W1, H2, W2 = cost_volume_outter.shape
-        cost_maps = (
-            cost_volume_outter.permute(0, 2, 3, 1, 4, 5)
-            .contiguous()
-            .view(B * H1 * W1, self.cfg.cost_heads_num, H2, W2)
-        )
-        data["cost_maps_outter"] = cost_maps
-
-        B, heads, H1, W1, H2, W2 = cost_volume.shape
-        cost_maps = (
-            cost_volume.permute(0, 2, 3, 1, 4, 5)
-            .contiguous()
-            .view(B * H1 * W1, self.cfg.cost_heads_num, H2, W2)
-        )
-        data["cost_maps"] = cost_maps
-
-        (
-            ids_keep,
-            mask_for_keys,
-            mask_for_patch1,
-            mask_for_patch2,
-            mask_for_patch3,
-            ids_restore,
-        ) = self.random_masking(cost_maps, self.cfg.mask_ratio, mask)
-        # ids_keep = mask_for_keys = mask_for_patch1 = mask_for_patch2 = mask_for_patch3 = ids_restore = None
-
-        x, size = self.patch_embed(
-            cost_maps, mask_for_patch1, mask_for_patch2, mask_for_patch3
-        )  # B*H1*W1, size[0]*size[1], C
-
-        data["H3W3"] = size
-        H3, W3 = size
-
-        cost_patches = x
-
-        x = self.input_layer(self.latent_tokens, x, size, ids_keep)
-
-        short_cut = x
-
-        for idx, layer in enumerate(self.encoder_layers):
-
             x = layer(x)
             if self.cfg.vertical_encoder_attn is not None:
                 x = (
@@ -534,12 +467,6 @@ class MemoryEncoder(nn.Module):
             self.feat_encoder = twins_svt_large(
                 pretrained=self.cfg.pretrain, del_layers=cfg.del_layers
             )
-        elif "jh" in cfg.fnet:
-            self.feat_encoder = twins_svt_large_jihao(
-                pretrained=self.cfg.pretrain,
-                del_layers=cfg.del_layers,
-                version=cfg.fnet,
-            )
         elif cfg.fnet == "basicencoder":
             self.feat_encoder = BasicEncoder(output_dim=256, norm_fn="instance")
         elif cfg.fnet == "convnext":
@@ -569,7 +496,6 @@ class MemoryEncoder(nn.Module):
             )
 
     def corr(self, fmap1, fmap2):
-
         batch, dim, ht, wd = fmap1.shape
         _, _, ht2, wd2 = fmap2.shape
 
@@ -584,75 +510,15 @@ class MemoryEncoder(nn.Module):
 
         return corr
 
-    def corr_16(self, fmap1, fmap2):
-
-        batch, dim, ht, wd = fmap1.shape
-        _, _, ht2, wd2 = fmap2.shape
-
-        # fmap1 = F.avg_pool2d(fmap1, kernel_size=2, stride=2, padding=0)
-        fmap1 = fmap1[:, :, ::2, ::2]
-
-        fmap1 = rearrange(
-            fmap1, "b (heads d) h w -> b heads (h w) d", heads=self.cfg.cost_heads_num
-        )
-        fmap2 = rearrange(
-            fmap2, "b (heads d) h w -> b heads (h w) d", heads=self.cfg.cost_heads_num
-        )
-        corr = einsum("bhid, bhjd -> bhij", fmap1, fmap2)
-        corr = corr.view(batch, self.cfg.cost_heads_num, ht // 2, wd // 2, ht2, wd2)
-
-        return corr
-
     def forward(self, img1, img2, data, context=None):
-
         feat_s, _ = self.feat_encoder(img1)
         feat_t, _ = self.feat_encoder(img2)
-
-        feat_s_16 = None
-        feat_t_16 = None
-
-        B, C, H, W = feat_s.shape
-        size = (H, W)
 
         if self.cfg.use_convertor:
             feat_s = self.channel_convertor(feat_s)
             feat_t = self.channel_convertor(feat_t)
 
         cost_volume = self.corr(feat_s, feat_t)
-        if self.cfg.r_16 > 0:
-            cost_volume_16 = self.corr_16(feat_s_16, feat_t_16)
-            B, heads, H1, W1, H2, W2 = cost_volume_16.shape
-            cost_maps = (
-                cost_volume_16.permute(0, 2, 3, 1, 4, 5)
-                .contiguous()
-                .view(B * H1 * W1, self.cfg.cost_heads_num, H2, W2)
-            )
-            data["cost_maps_16"] = cost_maps
-
         x, cost_patches = self.cost_perceiver_encoder(cost_volume, data, context)
-
-        return x, cost_patches, feat_s_16, feat_t_16
-
-    def pretrain_forward(
-        self, img1, img2, img1_inner, img2_inner, data, context=None, mask=None
-    ):
-
-        feat_t, _ = self.feat_encoder(img2)
-
-        feat_s_inner, _ = self.feat_encoder(img1_inner)
-        feat_t_inner, _ = self.feat_encoder(img2_inner)
-
-        cost_volume = self.corr(feat_s_inner, feat_t)
-        if self.cfg.crop_cost_volume:
-            H_border = self.cfg.H_offset // 8
-            W_border = self.cfg.W_offset // 8
-            cost_volume_inner = cost_volume[
-                :, :, :, :, H_border:-H_border, W_border:-W_border
-            ]
-        else:
-            cost_volume_inner = self.corr(feat_s_inner, feat_t_inner)
-        x, cost_patches = self.cost_perceiver_encoder.pretrain_forward(
-            cost_volume, cost_volume_inner, data, context, mask=mask
-        )
 
         return x, cost_patches
